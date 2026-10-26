@@ -1,0 +1,8 @@
+{
+  "name": "QuantumTrade AI - Crypto & Forex Autonomous Trading Bot",
+  "description": "ระบบบอทเทรด Crypto Futures และ Forex อัตโนมัติ 24/7 พร้อม Paper Trading, Self-Learning AI, ระบบหลบหลีกข่าว และแจ้งเตือน Telegram บน Google Free Tier",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
