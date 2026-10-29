@@ -1,0 +1,23 @@
+# Worker Configuration (worker/.env)
+
+# Binance Testnet API Keys (get from https://testnet.binance.vision)
+BINANCE_ENV=testnet
+BINANCE_TESTNET_API_KEY=your_binance_testnet_api_key_here
+BINANCE_TESTNET_API_SECRET=your_binance_testnet_api_secret_here
+
+# Gemini AI (get from https://aistudio.google.com)
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Worker Server (Tailscale - update with your IPs)
+WORKER_HOST=100.85.216.9
+WORKER_PORT=4000
+WORKER_TOKEN=your_worker_token_here
+
+# Scanning
+SCAN_INTERVAL=300000
+VOLUME_FILTER=5000000
+MAX_ORDERS_PER_SYMBOL=3
+
+# Mode
+DRY_RUN=true
+ALLOW_LIVE=false
