@@ -193,6 +193,21 @@ app.post('/api/exchange/order', async (req, res) => {
   catch (e: any) { res.status(502).json({ ok: false, message: e.message }); }
 });
 
+// ---- Phase 1 scanner status (proxied to the worker) ----
+const forward = (method: 'GET' | 'POST') => async (req: express.Request, res: express.Response) => {
+  try {
+    const { status, body } = await callWorker(req.originalUrl.replace('/api/phase1', '/phase1'), {
+      method, body: method === 'POST' ? JSON.stringify(req.body ?? {}) : undefined,
+    });
+    res.status(status).json(body);
+  } catch (e: any) { res.status(502).json({ ok: false, message: e.message }); }
+};
+app.get('/api/phase1/status', forward('GET'));
+app.get('/api/phase1/signals', forward('GET'));
+app.get('/api/phase1/positions', forward('GET'));
+app.post('/api/phase1/scan', forward('POST'));
+app.post('/api/phase1/reset-breaker', forward('POST'));
+
 // Setup Vite or Static Server
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

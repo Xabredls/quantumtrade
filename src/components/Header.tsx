@@ -18,8 +18,8 @@ import {
 import { TestnetApiConfig } from '../types/trading';
 
 interface HeaderProps {
-  activeTab: 'unified_autopilot' | 'workstation' | 'self_learning' | 'news_radar' | 'multi_account' | 'backtest' | 'tailscale_mobile';
-  setActiveTab: (tab: 'unified_autopilot' | 'workstation' | 'self_learning' | 'news_radar' | 'multi_account' | 'backtest' | 'tailscale_mobile') => void;
+  activeTab: 'unified_autopilot' | 'workstation' | 'self_learning' | 'news_radar' | 'multi_account' | 'backtest' | 'tailscale_mobile' | 'phase1_bots';
+  setActiveTab: (tab: 'unified_autopilot' | 'workstation' | 'self_learning' | 'news_radar' | 'multi_account' | 'backtest' | 'tailscale_mobile' | 'phase1_bots') => void;
   engineRunning: boolean;
   setEngineRunning: (running: boolean) => void;
   lang: 'th' | 'en';
@@ -130,6 +130,16 @@ export const Header: React.FC<HeaderProps> = ({
           >
             <Smartphone className="w-4 h-4 text-emerald-400 shrink-0" />
             <span>{lang === 'th' ? 'Tailscale' : 'Tailscale'}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('phase1_bots')}
+            className={`flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+              activeTab === 'phase1_bots' ? 'text-emerald-400 font-semibold' : 'hover:text-slate-200'
+            }`}
+          >
+            <Bot className="w-4 h-4 shrink-0" />
+            <span>Phase 1</span>
           </button>
         </nav>
 
@@ -251,6 +261,12 @@ export const Header: React.FC<HeaderProps> = ({
           className={`px-2 py-1 rounded whitespace-nowrap font-mono ${activeTab === 'tailscale_mobile' ? 'text-emerald-400 font-bold bg-emerald-500/10' : 'text-slate-400'}`}
         >
           {lang === 'th' ? '📱มือถือ' : '📱Mobile'}
+        </button>
+        <button
+          onClick={() => setActiveTab('phase1_bots')}
+          className={`px-2 py-1 rounded whitespace-nowrap ${activeTab === 'phase1_bots' ? 'text-emerald-400 font-bold' : 'text-slate-400'}`}
+        >
+          Phase 1
         </button>
       </div>
     </header>

@@ -12,6 +12,7 @@ import { NewsRadarView } from './components/NewsRadarView';
 import { MultiAccountView } from './components/MultiAccountView';
 import { BacktestView } from './components/BacktestView';
 import { TailscaleMobileView } from './components/TailscaleMobileView';
+import { BotStatusView } from './components/BotStatusView';
 import { GoogleFreeTierModal } from './components/GoogleFreeTierModal';
 import { TelegramModal } from './components/TelegramModal';
 import { SecurityVaultModal } from './components/SecurityVaultModal';
@@ -59,7 +60,7 @@ import { calculateMicroPositionSize } from './utils/binanceLiveService';
 
 export default function App() {
   const [lang, setLang] = useState<'th' | 'en'>('th');
-  const [activeTab, setActiveTab] = useState<'unified_autopilot' | 'workstation' | 'self_learning' | 'news_radar' | 'multi_account' | 'backtest' | 'tailscale_mobile'>('unified_autopilot');
+  const [activeTab, setActiveTab] = useState<'unified_autopilot' | 'workstation' | 'self_learning' | 'news_radar' | 'multi_account' | 'backtest' | 'tailscale_mobile' | 'phase1_bots'>('unified_autopilot');
   const [engineRunning, setEngineRunning] = useState<boolean>(true);
 
   // Tri-Engine Autonomous Engines State (Binance Futures, Crypto Spot, Forex & Gold)
@@ -919,6 +920,10 @@ export default function App() {
 
         {activeTab === 'backtest' && (
           <BacktestView lang={lang} />
+        )}
+
+        {activeTab === 'phase1_bots' && (
+          <BotStatusView lang={lang} />
         )}
 
         {activeTab === 'tailscale_mobile' && (

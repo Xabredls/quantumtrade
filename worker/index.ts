@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { BinanceFutures, GeoBlockedError, type BinanceEnv } from './binance.ts';
+import { startPhase1, handlePhase1, type Phase1Handle } from './phase1/main.ts';
 
 dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), '.env') });
 
@@ -35,10 +36,18 @@ const readJson = (req: http.IncomingMessage) => new Promise<any>((resolve, rejec
   req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { reject(new Error('invalid JSON')); } });
 });
 
+// Phase 1 multi-bot scanner (paper trading). Off unless PHASE1_ENABLED=true; a failure here never stops the worker.
+let phase1: Phase1Handle | null = null;
+startPhase1(process.env).then((h) => { phase1 = h; }).catch((e) => console.error('[phase1] เริ่มไม่ได้:', (e as Error).message));
+
 http.createServer(async (req, res) => {
   try {
     if (req.url === '/health') return send(res, 200, { ok: true, env, dryRun });
     if (!authorized(req)) return send(res, 401, { ok: false, message: 'unauthorized' });
+    if (req.url?.startsWith('/phase1/')) {
+      if (!phase1) return send(res, 503, { ok: false, message: 'Phase 1 ปิดอยู่หรือยังเริ่มไม่สำเร็จ (ตั้ง PHASE1_ENABLED=true ใน worker/.env แล้วดู log)' });
+      return handlePhase1(req, res, phase1);
+    }
 
     if (req.url === '/test' && req.method === 'GET') {
       const t0 = Date.now();
@@ -66,3 +75,7 @@ http.createServer(async (req, res) => {
     send(res, code, { ok: false, message: (e as Error).message });
   }
 }).listen(port, host, () => console.log(`worker (${env}, dryRun=${dryRun}) listening on ${host}:${port}`));
+
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => { void (phase1 ? phase1.stop() : Promise.resolve()).finally(() => process.exit(0)); });
+}

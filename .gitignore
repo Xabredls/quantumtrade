@@ -10,3 +10,5 @@ coverage/
 .env
 worker/.env
 backups
+*.zip
+worker/phase1/data/
