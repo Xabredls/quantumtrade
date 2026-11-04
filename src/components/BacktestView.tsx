@@ -1,582 +1,188 @@
-import React, { useState, useId, useEffect } from 'react';
-import { 
-  History, 
-  Play, 
-  BarChart, 
-  CheckCircle2, 
-  XCircle, 
-  TrendingUp, 
-  TrendingDown, 
-  Scale, 
-  Percent, 
-  ShieldAlert,
-  ArrowUpRight,
-  Sparkles,
-  Zap,
-  Gauge,
-  Activity,
-  Layers,
-  FastForward,
-  RotateCcw
-} from 'lucide-react';
-import { BacktestConfig, BacktestResult, runHistoricalBacktest } from '../utils/backtestEngine';
+import React, { useCallback, useEffect, useState } from 'react';
+import { RefreshCw, ShieldAlert } from 'lucide-react';
 
-interface BacktestViewProps {
-  lang: 'th' | 'en';
+// REAL backtest results produced by `worker/phase1/backtest` (real exchange history, same rules as the live bot).
+// This replaces the old simulator that generated random candles and random win/loss outcomes.
+
+type Market = 'futures' | 'spot' | 'forex';
+interface Slice { n: number; winRate: number | null; pnlUsd: number; expectancyR: number | null }
+interface Report {
+  market: Market; createdAt: number; params: Record<string, number | string>; symbols: string[];
+  range: { from: number | null; to: number | null };
+  dataQuality: Record<string, { bars: number; first: number | null; last: number | null; gaps: number; largestGapHours: number; removed: number }>;
+  summary: {
+    trades: number; wins: number; losses: number; winRate: number | null; profitFactor: number | null; expectancyR: number | null;
+    expectancyUsd: number | null; totalPnlUsd: number; maxDrawdownUsd: number; longestLossStreak: number; avgHoldHours: number | null;
+    outcomes: { tp: number; sl: number; timeout: number };
+  };
+  byYear: Record<string, Slice>; bySide: Record<string, Slice>; bySymbol: Record<string, Slice>; byHalf: Record<string, Slice>;
+  signals: number; skipped: Record<string, number>; unfinished: number;
+  equity: Array<{ t: number; pnl: number }>;
+  bootstrap: { mean: number | null; lo: number | null; hi: number | null };
+  benchmark: { iterations: number; tradesPerIteration: number; actualMeanR: number | null; random: { mean: number; sd: number; p5: number; p50: number; p95: number } | null; pValue: number | null };
+  reference: Record<string, { from: number; to: number; holdReturnPct: number }>;
+  warnings: string[];
+}
+interface DataFile { symbol: string; interval: string; bars: number; first: number | null; last: number | null }
+
+const MARKETS: Array<{ id: Market; th: string; en: string }> = [
+  { id: 'futures', th: 'Binance Futures', en: 'Binance Futures' },
+  { id: 'spot', th: 'Binance Spot', en: 'Binance Spot' },
+  { id: 'forex', th: 'Forex + ทอง', en: 'Forex + Gold' },
+];
+const n2 = (x: number | null | undefined, d = 2) => (x === null || x === undefined || !Number.isFinite(x) ? '-' : x.toFixed(d));
+const pct = (x: number | null | undefined, d = 1) => (x === null || x === undefined ? '-' : `${(x * 100).toFixed(d)}%`);
+const day = (ms: number | null) => (ms ? new Date(ms).toISOString().slice(0, 10) : '-');
+
+/** Plain-language reading of the numbers. Deliberately hard to impress. */
+function verdict(r: Report, th: boolean): { tone: 'good' | 'bad' | 'neutral'; text: string } {
+  const s = r.summary, b = r.bootstrap, p = r.benchmark.pValue;
+  if (s.trades < 100) return { tone: 'neutral', text: th ? `มีเพียง ${s.trades} เทรด น้อยเกินกว่าจะสรุป` : `Only ${s.trades} trades — too few to conclude anything` };
+  if (b.hi !== null && b.hi < 0) return { tone: 'bad', text: th ? 'ขาดทุนอย่างมีนัยสำคัญ: ช่วงเชื่อมั่น 95% ของกำไรต่อเทรดอยู่ต่ำกว่าศูนย์ทั้งช่วง' : 'Significantly losing: the whole 95% interval is below zero' };
+  if (b.lo !== null && b.lo > 0 && p !== null && p < 0.05) return { tone: 'good', text: th ? 'พบสัญญาณว่ามี edge เชิงสถิติ (ทั้งช่วงเชื่อมั่นเป็นบวก และดีกว่าสุ่มจังหวะเข้า) แต่ยังต้องยืนยันกับข้อมูลช่วงอื่นและการรันสดก่อนเชื่อ' : 'Statistical edge detected (interval above zero and better than random timing) — still confirm on other periods and live' };
+  return { tone: 'neutral', text: th ? 'ยังไม่มีหลักฐานว่ากลยุทธ์ทำกำไรได้ ช่วงเชื่อมั่นคร่อมศูนย์หรือไม่ดีกว่าสุ่มจังหวะเข้า' : 'No evidence yet that the strategy makes money: interval straddles zero or does not beat random timing' };
 }
 
-export const BacktestView: React.FC<BacktestViewProps> = ({ lang }) => {
-  const [subTab, setSubTab] = useState<'backtest' | 'forward_test' | 'monte_carlo'>('backtest');
+const Equity: React.FC<{ pts: Array<{ t: number; pnl: number }> }> = ({ pts }) => {
+  if (pts.length < 2) return null;
+  const W = 600, H = 150, pad = 6;
+  const xs = pts.map((p) => p.t), ys = pts.map((p) => p.pnl);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(0, ...ys), y1 = Math.max(0, ...ys);
+  const X = (t: number) => pad + ((t - x0) / Math.max(1, x1 - x0)) * (W - 2 * pad);
+  const Y = (v: number) => H - pad - ((v - y0) / Math.max(1e-9, y1 - y0)) * (H - 2 * pad);
+  const d = pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.pnl).toFixed(1)}`).join(' ');
+  const last = pts[pts.length - 1].pnl;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-36 rounded bg-slate-900/50">
+      <line x1={pad} x2={W - pad} y1={Y(0)} y2={Y(0)} stroke="#475569" strokeDasharray="4 4" />
+      <path d={d} fill="none" stroke={last >= 0 ? '#34d399' : '#f87171'} strokeWidth="1.5" />
+    </svg>
+  );
+};
 
-  const [config, setConfig] = useState<BacktestConfig>({
-    symbol: 'BTC/USDT',
-    marketType: 'crypto_futures',
-    strategy: 'delta_neutral_arbitrage',
-    timeframe: '15m',
-    durationLabel: '1 ปี (30,000 แท่ง)',
-    candleCount: 3000,
-    initialBalance: 10000,
-    leverage: 10,
-    riskPerTradePct: 1.0,
-    slippagePct: 0.02,
-    feeRatePct: 0.04,
-    enableTrailingStop: true,
-    enableMonteCarlo: true,
-    enableAiConfluenceFilter: true,
-  });
+const Table: React.FC<{ rows: Array<[string, Slice]>; th: boolean }> = ({ rows, th }) => (
+  <table className="w-full text-left text-xs">
+    <thead className="text-slate-400"><tr><th className="p-1">&nbsp;</th><th>{th ? 'เทรด' : 'trades'}</th><th>Win%</th><th>R/{th ? 'เทรด' : 'trade'}</th><th>PnL</th></tr></thead>
+    <tbody>
+      {rows.map(([k, v]) => (
+        <tr key={k} className="border-t border-slate-800">
+          <td className="p-1 font-mono">{k}</td><td>{v.n}</td><td>{pct(v.winRate, 0)}</td>
+          <td className={(v.expectancyR ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}>{n2(v.expectancyR, 3)}</td>
+          <td className={v.pnlUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}>{n2(v.pnlUsd)}</td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+);
 
-  const btMarketTypeId = useId();
-  const btSymbolId = useId();
-  const btStrategyId = useId();
-  const btTimeframeId = useId();
-  const btDurationId = useId();
-  const btLeverageId = useId();
-  const btRiskPctId = useId();
+export const BacktestView: React.FC<{ lang: 'th' | 'en' }> = ({ lang }) => {
+  const th = lang === 'th';
+  const [market, setMarket] = useState<Market>('futures');
+  const [report, setReport] = useState<Report | null>(null);
+  const [files, setFiles] = useState<DataFile[]>([]);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  const [result, setResult] = useState<BacktestResult>(() => runHistoricalBacktest(config));
-  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const load = useCallback(async (m: Market) => {
+    setLoading(true);
+    try {
+      const [r, d] = await Promise.all([fetch(`/api/phase1/backtest/latest?market=${m}`), fetch('/api/phase1/backtest/data')]);
+      const rb = await r.json().catch(() => ({}));
+      if (r.ok) { setReport(rb.report); setMsg(null); } else { setReport(null); setMsg(rb.message || `HTTP ${r.status}`); }
+      const db = await d.json().catch(() => ({}));
+      setFiles(d.ok ? (db.datasets?.[m] ?? []) : []);
+    } catch (e: any) { setReport(null); setMsg(e.message); } finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void load(market); }, [market, load]);
 
-  // Forward Test State
-  const [forwardSpeed, setForwardSpeed] = useState<number>(10);
-  const [isForwardRunning, setIsForwardRunning] = useState<boolean>(true);
-  const [forwardCandlesProcessed, setForwardCandlesProcessed] = useState<number>(142);
-  const [forwardEquity, setForwardEquity] = useState<number>(10485.20);
-  const [forwardTradesCount, setForwardTradesCount] = useState<number>(18);
-  const [forwardWins, setForwardWins] = useState<number>(16);
-
-  useEffect(() => {
-    if (!isForwardRunning) return;
-    const interval = setInterval(() => {
-      setForwardCandlesProcessed(prev => prev + 1);
-      if (Math.random() > 0.6) {
-        const isWin = Math.random() > 0.12; // 88% win rate with AI confluence
-        const delta = isWin ? Math.round(35 + Math.random() * 85) : -Math.round(20 + Math.random() * 40);
-        setForwardEquity(prev => Number((prev + delta).toFixed(2)));
-        setForwardTradesCount(prev => prev + 1);
-        if (isWin) setForwardWins(prev => prev + 1);
-      }
-    }, 2000 / (forwardSpeed || 1));
-
-    return () => clearInterval(interval);
-  }, [isForwardRunning, forwardSpeed]);
-
-  const handleRun = () => {
-    setIsRunning(true);
-    setTimeout(() => {
-      const res = runHistoricalBacktest(config);
-      setResult(res);
-      setIsRunning(false);
-    }, 300);
-  };
-
-  const metrics = result.metrics;
-  const isNetProfit = metrics.totalPnl >= 0;
-
-  // Equity Curve SVG calculation
-  const chartHeight = 220;
-  const chartWidth = 720;
-  const equities = result.equityCurve.map(e => e.equity);
-  const minEq = Math.min(...equities) * 0.995;
-  const maxEq = Math.max(...equities) * 1.005;
-  const rangeEq = maxEq - minEq || 1;
-
-  const getY = (eq: number) => chartHeight - ((eq - minEq) / rangeEq) * (chartHeight - 30) - 15;
-
-  const points = result.equityCurve.map((e, idx) => {
-    const x = (idx / (result.equityCurve.length - 1 || 1)) * (chartWidth - 50) + 25;
-    return `${x},${getY(e.equity)}`;
-  }).join(' ');
-
-  const areaPoints = `${points} ${chartWidth - 25},${chartHeight} 25,${chartHeight}`;
+  const v = report ? verdict(report, th) : null;
+  const tone = v?.tone === 'good' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200' : v?.tone === 'bad' ? 'border-red-500/50 bg-red-500/10 text-red-200' : 'border-amber-500/50 bg-amber-500/10 text-amber-200';
+  const sym = report ? Object.entries(report.bySymbol).sort((a, b) => b[1].pnlUsd - a[1].pnlUsd) : [];
+  const cmd = `npx tsx worker/phase1/backtest/run.ts download --market ${market}${market === 'forex' ? '' : ' --top 20'}\nnpx tsx worker/phase1/backtest/run.ts run --market ${market}`;
 
   return (
-    <div className="space-y-6">
-      
-      {/* Top Banner & Launcher Panel */}
-      <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/60">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <History className="w-5 h-5 text-emerald-400" />
-              <h2 className="text-base font-bold text-white">
-                {lang === 'th' ? 'ระบบจำลองผลลัพธ์ย้อนหลังระยะยาว & Forward Testing' : 'Long-Term Backtest & Live Forward Testing'}
-              </h2>
-            </div>
-            <p className="text-xs text-slate-400 mt-0.5">
-              {lang === 'th'
-                ? 'ทดสอบความทนทานของกลยุทธ์ Day Trade และ Arbitrage ย้อนหลังได้สูงสุด 1–3 ปี (30,000 แท่ง) พร้อมระบบ Forward Testing และ Monte Carlo ป้องกัน Overfitting'
-                : 'Simulate up to 3 years of market cycles with Monte Carlo risk of ruin modeling and live forward walk testing.'}
-            </p>
-          </div>
-
-          <div className="flex items-center gap-3">
-            {/* Sub-tab navigation buttons */}
-            <div className="flex items-center gap-1 p-1 bg-slate-950 border border-slate-800 rounded-lg text-xs">
-              <button
-                onClick={() => setSubTab('backtest')}
-                className={`px-3 py-1.5 rounded-md font-semibold transition-colors ${
-                  subTab === 'backtest' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {lang === 'th' ? 'ทดสอบย้อนหลัง (Backtest)' : 'Historical Backtest'}
-              </button>
-              <button
-                onClick={() => setSubTab('forward_test')}
-                className={`px-3 py-1.5 rounded-md font-semibold transition-colors ${
-                  subTab === 'forward_test' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {lang === 'th' ? 'ทดสอบเดินหน้า (Forward Test)' : 'Live Forward Test'}
-              </button>
-              <button
-                onClick={() => setSubTab('monte_carlo')}
-                className={`px-3 py-1.5 rounded-md font-semibold transition-colors ${
-                  subTab === 'monte_carlo' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {lang === 'th' ? 'Monte Carlo (1,000 รอบ)' : 'Monte Carlo Risk'}
-              </button>
-            </div>
-
-            <button
-              onClick={handleRun}
-              disabled={isRunning}
-              className={`flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg text-white shadow-md transition-all whitespace-nowrap ${
-                isRunning ? 'bg-slate-800 text-slate-500' : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-500/20'
-              }`}
-            >
-              <Play className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin' : ''}`} />
-              <span>{isRunning ? (lang === 'th' ? 'กำลังประมวลผล...' : 'Simulating...') : (lang === 'th' ? 'รันการทดสอบ' : 'Run Simulation')}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Backtest Parameters Matrix */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 pt-4 text-xs">
-          <div>
-            <label htmlFor={btMarketTypeId} className="block text-slate-400 text-[11px] mb-1">{lang === 'th' ? 'ตลาด' : 'Market'}</label>
-            <select
-              id={btMarketTypeId}
-              value={config.marketType}
-              onChange={(e) => {
-                const mt = e.target.value as any;
-                setConfig({
-                  ...config,
-                  marketType: mt,
-                  symbol: mt === 'crypto_futures' ? 'BTC/USDT' : 'EUR/USD',
-                });
-              }}
-              className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200"
-            >
-              <option value="crypto_futures">Crypto Futures</option>
-              <option value="forex">Forex & Gold</option>
-            </select>
-          </div>
-
-          <div>
-            <label htmlFor={btSymbolId} className="block text-slate-400 text-[11px] mb-1">{lang === 'th' ? 'คู่เหรียญ' : 'Symbol'}</label>
-            <select
-              id={btSymbolId}
-              value={config.symbol}
-              onChange={(e) => setConfig({ ...config, symbol: e.target.value })}
-              className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono"
-            >
-              {config.marketType === 'crypto_futures' ? (
-                <>
-                  <option value="BTC/USDT">BTC/USDT</option>
-                  <option value="ETH/USDT">ETH/USDT</option>
-                  <option value="SOL/USDT">SOL/USDT</option>
-                  <option value="BNB/USDT">BNB/USDT</option>
-                </>
-              ) : (
-                <>
-                  <option value="EUR/USD">EUR/USD</option>
-                  <option value="GBP/USD">GBP/USD</option>
-                  <option value="USD/JPY">USD/JPY</option>
-                  <option value="XAU/USD">XAU/USD (Gold)</option>
-                </>
-              )}
-            </select>
-          </div>
-
-          <div>
-            <label htmlFor={btStrategyId} className="block text-slate-400 text-[11px] mb-1">{lang === 'th' ? 'กลยุทธ์ Day Trade / Arbitrage' : 'Strategy'}</label>
-            <select
-              id={btStrategyId}
-              value={config.strategy}
-              onChange={(e) => setConfig({ ...config, strategy: e.target.value as any })}
-              className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200"
-            >
-              <option value="delta_neutral_arbitrage">Delta-Neutral Funding Arbitrage (ปลอดภัยสูงสุด ได้กำไรแน่นอน)</option>
-              <option value="adaptive_ensemble">Adaptive AI Ensemble (เรียนรู้สภาวะตลาดอัตโนมัติ)</option>
-              <option value="dynamic_ema_vwap">Dynamic EMA/VWAP Trend Following</option>
-              <option value="bollinger_rsi_reversion">Bollinger + RSI Scalper Reversion</option>
-              <option value="atr_channel_breakout">ATR Channel Volatility Breakout</option>
-            </select>
-          </div>
-
-          <div>
-            <label htmlFor={btTimeframeId} className="block text-slate-400 text-[11px] mb-1">{lang === 'th' ? 'ไทม์เฟรม' : 'Timeframe'}</label>
-            <select
-              id={btTimeframeId}
-              value={config.timeframe}
-              onChange={(e) => setConfig({ ...config, timeframe: e.target.value as any })}
-              className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono"
-            >
-              <option value="1m">1m (Ultra Scalp)</option>
-              <option value="5m">5m (Intraday)</option>
-              <option value="15m">15m (Day Trade มาตรฐาน)</option>
-              <option value="1h">1h (Swing Day)</option>
-              <option value="4h">4h (Macro Cycle)</option>
-              <option value="1D">1D (Daily Horizon)</option>
-            </select>
-          </div>
-
-          <div>
-            <label htmlFor={btDurationId} className="block text-slate-400 text-[11px] mb-1">{lang === 'th' ? 'ระยะเวลาย้อนหลัง' : 'Historical Horizon'}</label>
-            <select
-              id={btDurationId}
-              value={config.candleCount}
-              onChange={(e) => {
-                const count = parseInt(e.target.value);
-                setConfig({
-                  ...config,
-                  candleCount: count,
-                  durationLabel: e.target.options[e.target.selectedIndex].text,
-                });
-              }}
-              className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono"
-            >
-              <option value="500">500 แท่ง (~5 วัน)</option>
-              <option value="1500">1,500 แท่ง (~2 สัปดาห์)</option>
-              <option value="3000">3,000 แท่ง (~1 เดือน)</option>
-              <option value="10000">10,000 แท่ง (~3.5 เดือน)</option>
-              <option value="30000">30,000 แท่ง (~1 ปีเต็ม)</option>
-            </select>
-          </div>
-
-          <div>
-            <label htmlFor={btRiskPctId} className="block text-slate-400 text-[11px] mb-1">{lang === 'th' ? 'ความเสี่ยงต่อไม้' : 'Risk % per trade'}</label>
-            <select
-              id={btRiskPctId}
-              value={config.riskPerTradePct}
-              onChange={(e) => setConfig({ ...config, riskPerTradePct: parseFloat(e.target.value) })}
-              className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 font-mono"
-            >
-              <option value="0.5">0.5% (Ultra Safe)</option>
-              <option value="1.0">1.0% (Professional)</option>
-              <option value="2.0">2.0% (Growth)</option>
-              <option value="3.0">3.0% (High Beta)</option>
-            </select>
-          </div>
-        </div>
-
-        {/* Safety & AI Confluence Checkboxes */}
-        <div className="flex flex-wrap items-center gap-6 mt-4 pt-3 border-t border-slate-800/80 text-xs">
-          <label className="flex items-center gap-2 cursor-pointer text-slate-300">
-            <input
-              type="checkbox"
-              checked={config.enableAiConfluenceFilter}
-              onChange={(e) => setConfig({ ...config, enableAiConfluenceFilter: e.target.checked })}
-              className="w-4 h-4 accent-emerald-500 rounded"
-            />
-            <span className="font-semibold text-emerald-400">
-              {lang === 'th' ? 'เปิดระบบ Gemini AI Confluence Guardian (กรองสัญญาณหลอก เข้าเฉพาะไม้ที่มีโอกาสชนะ > 88%)' : 'Enable Gemini AI Confluence Guardian'}
-            </span>
-          </label>
-
-          <label className="flex items-center gap-2 cursor-pointer text-slate-300">
-            <input
-              type="checkbox"
-              checked={config.enableTrailingStop}
-              onChange={(e) => setConfig({ ...config, enableTrailingStop: e.target.checked })}
-              className="w-4 h-4 accent-emerald-500 rounded"
-            />
-            <span>
-              {lang === 'th' ? 'เปิดระบบ Asymmetric Profit Lock (กำไรแตะ 1.5R ย้าย SL ล็อกกำไร +0.5R ทันที ปิดประตูขาดทุน)' : 'Asymmetric Profit Lock Trailing Stop'}
-            </span>
-          </label>
+    <div className="space-y-4 p-4 text-slate-200">
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-lg font-semibold">{th ? 'Backtest ข้อมูลจริง' : 'Real-data backtest'}</h2>
+        <div className="ml-auto flex gap-1">
+          {MARKETS.map((m) => (
+            <button key={m.id} onClick={() => setMarket(m.id)} className={`rounded px-3 py-1 text-sm ${market === m.id ? 'bg-emerald-600/80' : 'bg-slate-700/60 hover:bg-slate-700'}`}>{th ? m.th : m.en}</button>
+          ))}
+          <button onClick={() => void load(market)} className="rounded bg-slate-700/60 px-2 hover:bg-slate-700" title="refresh"><RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /></button>
         </div>
       </div>
 
-      {/* Subtab 1: Historical Backtest */}
-      {subTab === 'backtest' && (
+      <div className="rounded border border-slate-700 bg-slate-800/40 p-3 text-xs text-slate-300">
+        {th
+          ? 'ผลนี้มาจากราคาย้อนหลังจริง (Binance / Dukascopy) ด้วยกติกาเข้า-ออกเดียวกับบอท Phase 1 รวมค่าธรรมเนียมและ slippage ไม่รวมตัวกรอง Gemini AI (ทดสอบย้อนหลังอย่างซื่อสัตย์ไม่ได้) และไม่ได้ปรับพารามิเตอร์ให้เข้ากับข้อมูล'
+          : 'Built from real historical prices (Binance / Dukascopy) with the same entry/exit rules as the Phase 1 bot, including fees and slippage. The Gemini AI filter is not included (it cannot be backtested honestly) and parameters were not tuned to the data.'}
+      </div>
+
+      {!report && (
+        <div className="space-y-2 rounded border border-slate-700 p-4 text-sm">
+          <div className="flex items-center gap-2 text-amber-300"><ShieldAlert className="w-4 h-4" />{th ? 'ยังไม่มีผล backtest ของตลาดนี้' : 'No backtest result for this market yet'}{msg ? ` (${msg})` : ''}</div>
+          <p className="text-slate-400">{th ? 'รันบนเครื่องที่รัน worker (เครื่องที่ Binance เข้าถึงได้) แล้วกดรีเฟรชหน้านี้:' : 'Run on the machine that runs the worker, then refresh:'}</p>
+          <pre className="overflow-x-auto rounded bg-slate-900 p-2 text-xs">{cmd}</pre>
+        </div>
+      )}
+
+      {report && v && (
         <>
-          {/* Quantitative KPIs Matrix */}
-          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-            <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-900/40 font-mono">
-              <span className="text-[11px] text-slate-400 block mb-1">{lang === 'th' ? 'กำไรสุทธิรวม (Net PnL)' : 'Total Net PnL'}</span>
-              <span className={`text-lg font-bold tabular-nums ${isNetProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
-                {isNetProfit ? '+' : ''}${metrics.totalPnl.toFixed(2)} ({isNetProfit ? '+' : ''}{metrics.totalPnlPct}%)
-              </span>
-            </div>
+          <div className={`rounded border p-3 text-sm ${tone}`}>{v.text}</div>
 
-            <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-900/40 font-mono">
-              <span className="text-[11px] text-slate-400 block mb-1">{lang === 'th' ? 'อัตราชนะ (Win Rate)' : 'Win Rate'}</span>
-              <span className="text-lg font-bold text-white tabular-nums">{metrics.winRate}%</span>
-              <span className="text-[10px] text-slate-500 block">{metrics.winningTrades}W / {metrics.losingTrades}L</span>
-            </div>
-
-            <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-900/40 font-mono">
-              <span className="text-[11px] text-slate-400 block mb-1">{lang === 'th' ? 'Profit Factor' : 'Profit Factor'}</span>
-              <span className="text-lg font-bold text-sky-400 tabular-nums">{metrics.profitFactor}</span>
-              <span className="text-[10px] text-slate-500 block">&gt; 2.0 สม่ำเสมอสูง</span>
-            </div>
-
-            <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-900/40 font-mono">
-              <span className="text-[11px] text-slate-400 block mb-1">{lang === 'th' ? 'ขาดทุนสูงสุด (Max Drawdown)' : 'Max Drawdown'}</span>
-              <span className="text-lg font-bold text-amber-400 tabular-nums">-{metrics.maxDrawdownPct}%</span>
-              <span className="text-[10px] text-slate-500 block">{lang === 'th' ? 'ป้องกันพอร์ตแตก 100%' : 'Zero Ruin Risk'}</span>
-            </div>
-
-            <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-900/40 font-mono">
-              <span className="text-[11px] text-slate-400 block mb-1">Sharpe Ratio</span>
-              <span className="text-lg font-bold text-purple-400 tabular-nums">{metrics.sharpeRatio}</span>
-              <span className="text-[10px] text-slate-500 block">Sortino: {metrics.sortinoRatio}</span>
-            </div>
-
-            <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-900/40 font-mono">
-              <span className="text-[11px] text-slate-400 block mb-1">{lang === 'th' ? 'Walk-Forward Efficiency' : 'WFE Score'}</span>
-              <span className="text-lg font-bold text-emerald-400 tabular-nums">{result.walkForwardEfficiencyPct}%</span>
-              <span className="text-[10px] text-slate-500 block">ไม่ Overfitting</span>
-            </div>
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-6">
+            {[
+              [th ? 'เทรด' : 'Trades', String(report.summary.trades)],
+              ['Win rate', pct(report.summary.winRate)],
+              [th ? 'กำไร/เทรด (R)' : 'Expectancy (R)', n2(report.summary.expectancyR, 3)],
+              ['Profit factor', n2(report.summary.profitFactor)],
+              [`PnL (${th ? 'ไม้ละ' : 'per trade'} $${report.params.sizeUsd})`, `${n2(report.summary.totalPnlUsd)}`],
+              ['Max drawdown', `${n2(report.summary.maxDrawdownUsd)}`],
+            ].map(([k, val]) => (
+              <div key={k} className="rounded border border-slate-700 bg-slate-800/40 p-2"><div className="text-xs text-slate-400">{k}</div><div className="text-lg font-semibold">{val}</div></div>
+            ))}
+          </div>
+          <div className="text-xs text-slate-400">
+            {th ? 'ช่วงเชื่อมั่น 95% ของ R ต่อเทรด' : '95% interval of R per trade'}: {n2(report.bootstrap.lo, 3)} … {n2(report.bootstrap.hi, 3)} · {th ? 'ข้อมูล' : 'data'} {day(report.range.from ?? Math.min(...Object.values(report.reference).map((x) => x.from)))} → {day(Math.max(...Object.values(report.reference).map((x) => x.to)))} · {report.symbols.length} {th ? 'สัญลักษณ์' : 'symbols'} · {th ? 'สร้างเมื่อ' : 'created'} {new Date(report.createdAt).toLocaleString()}
           </div>
 
-          {/* Equity Curve SVG Chart */}
-          <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/40 space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <BarChart className="w-4 h-4 text-emerald-400" />
-                <span>{lang === 'th' ? 'กราฟการเติบโตของพอร์ตระยะยาว (Long-Term Equity Curve)' : 'Simulated Equity Growth Curve'}</span>
-              </h3>
-              <span className="text-xs font-mono text-slate-400">
-                {lang === 'th' ? 'เริ่มต้น' : 'Start'}: ${config.initialBalance} → {lang === 'th' ? 'สิ้นสุด' : 'End'}: ${(config.initialBalance + metrics.totalPnl).toFixed(2)}
-              </span>
+          <Equity pts={report.equity} />
+
+          {report.benchmark.random && (
+            <div className="rounded border border-slate-700 p-3 text-sm">
+              <div className="mb-1 font-semibold">{th ? 'เทียบกับการสุ่มจังหวะเข้า' : 'Versus random entry timing'}</div>
+              <div className="text-slate-300">
+                {th ? 'กลยุทธ์จริง' : 'Strategy'}: <b>{n2(report.benchmark.actualMeanR, 3)} R</b> · {th ? 'สุ่ม' : 'random'}: {n2(report.benchmark.random.mean, 3)} R ({n2(report.benchmark.random.p5, 3)} … {n2(report.benchmark.random.p95, 3)}) · p = <b>{n2(report.benchmark.pValue, 3)}</b>
+              </div>
+              <div className="mt-1 text-xs text-slate-400">{th ? 'p เล็ก (< 0.05) = จังหวะเข้าของสัญญาณดีกว่าการสุ่มจริง p ใหญ่ = ยังไม่มีหลักฐานว่าสัญญาณมีค่า' : 'Small p (< 0.05) = signal timing really beats random. Large p = no evidence the signal adds value.'}</div>
             </div>
+          )}
 
-            <div className="relative w-full rounded-lg bg-slate-950 p-3 border border-slate-800/80">
-              <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} className="w-full h-auto select-none" preserveAspectRatio="none">
-                <defs>
-                  <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#10b981" stopOpacity="0.25" />
-                    <stop offset="100%" stopColor="#10b981" stopOpacity="0.0" />
-                  </linearGradient>
-                </defs>
-
-                <polygon points={areaPoints} fill="url(#equityGrad)" />
-
-                <line 
-                  x1="25" 
-                  y1={getY(config.initialBalance)} 
-                  x2={chartWidth - 25} 
-                  y2={getY(config.initialBalance)} 
-                  stroke="#475569" 
-                  strokeDasharray="4 4" 
-                  strokeWidth="1" 
-                />
-
-                <polyline fill="none" stroke="#10b981" strokeWidth="2" points={points} />
-              </svg>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded border border-slate-700 p-3"><div className="mb-1 text-sm font-semibold">{th ? 'รายปี' : 'By year'}</div><Table rows={Object.entries(report.byYear)} th={th} /></div>
+            <div className="rounded border border-slate-700 p-3">
+              <div className="mb-1 text-sm font-semibold">{th ? 'ครึ่งแรก vs ครึ่งหลัง / ด้าน' : 'First vs second half / side'}</div>
+              <Table rows={[...Object.entries(report.byHalf), ...Object.entries(report.bySide)]} th={th} />
             </div>
+            <div className="rounded border border-slate-700 p-3"><div className="mb-1 text-sm font-semibold">{th ? 'สัญลักษณ์ที่ดีที่สุด' : 'Best symbols'}</div><Table rows={sym.slice(0, 6)} th={th} /></div>
+            <div className="rounded border border-slate-700 p-3"><div className="mb-1 text-sm font-semibold">{th ? 'สัญลักษณ์ที่แย่ที่สุด' : 'Worst symbols'}</div><Table rows={sym.slice(-6).reverse()} th={th} /></div>
+          </div>
+
+          <div className="rounded border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-200">
+            <div className="mb-1 font-semibold">{th ? 'ข้อควรระวัง' : 'Caveats'}</div>
+            <ul className="list-disc space-y-1 pl-4">{report.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
           </div>
         </>
       )}
 
-      {/* Subtab 2: Live Forward Testing Lab */}
-      {subTab === 'forward_test' && (
-        <div className="space-y-4">
-          <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/50 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-emerald-400" />
-                  <span>{lang === 'th' ? 'ห้องทดลอง Forward Test เดินหน้าแบบสด (Out-Of-Sample Validation)' : 'Live Forward Test Execution Lab'}</span>
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  {lang === 'th'
-                    ? 'รันกลยุทธ์เทียบกับข้อมูลสดที่ยังไม่เคยเกิดขึ้น เพื่อยืนยันว่ากลยุทธ์สร้างผลกำไรได้จริงโดยไม่หลอกตัวเอง'
-                    : 'Tests live execution against unseen tick flows to prove algorithmic edge.'}
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-slate-400">{lang === 'th' ? 'ความเร็วการทดสอบ:' : 'Speed'}:</span>
-                {[1, 5, 10, 50].map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => setForwardSpeed(s)}
-                    className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors ${
-                      forwardSpeed === s
-                        ? 'border-emerald-500 bg-emerald-500/20 text-emerald-300 font-bold'
-                        : 'border-slate-800 bg-slate-950 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {s}x
-                  </button>
-                ))}
-                <button
-                  onClick={() => setIsForwardRunning(!isForwardRunning)}
-                  className={`ml-2 px-3 py-1 text-xs font-bold rounded ${
-                    isForwardRunning ? 'bg-amber-600 text-white' : 'bg-emerald-600 text-white'
-                  }`}
-                >
-                  {isForwardRunning ? (lang === 'th' ? 'พัก' : 'Pause') : (lang === 'th' ? 'เริ่มต่อ' : 'Resume')}
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-2">
-              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono">
-                <span className="text-slate-400 text-[11px] block">{lang === 'th' ? 'ทุนสะสม Forward Test' : 'Forward Equity'}</span>
-                <span className="text-lg font-bold text-emerald-400">${forwardEquity.toFixed(2)}</span>
-                <span className="text-[10px] text-slate-500 block">+{(((forwardEquity - 10000) / 10000) * 100).toFixed(2)}%</span>
-              </div>
-              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono">
-                <span className="text-slate-400 text-[11px] block">{lang === 'th' ? 'จำนวนออเดอร์ที่เปิดจริง' : 'Executed Trades'}</span>
-                <span className="text-lg font-bold text-white">{forwardTradesCount} ไม้</span>
-                <span className="text-[10px] text-emerald-400 block">{forwardWins} ชนะ / {forwardTradesCount - forwardWins} แพ้</span>
-              </div>
-              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono">
-                <span className="text-slate-400 text-[11px] block">{lang === 'th' ? 'Forward Win Rate' : 'Forward Win Rate'}</span>
-                <span className="text-lg font-bold text-sky-400">
-                  {forwardTradesCount > 0 ? ((forwardWins / forwardTradesCount) * 100).toFixed(1) : '100'}%
-                </span>
-                <span className="text-[10px] text-slate-500 block">AI Filter Active</span>
-              </div>
-              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono">
-                <span className="text-slate-400 text-[11px] block">{lang === 'th' ? 'แท่งเทียนที่ประมวลผล' : 'Candles Processed'}</span>
-                <span className="text-lg font-bold text-purple-400">{forwardCandlesProcessed}</span>
-                <span className="text-[10px] text-slate-500 block">Streaming Live</span>
-              </div>
-            </div>
+      {files.length > 0 && (
+        <details className="rounded border border-slate-700 p-3 text-xs text-slate-400">
+          <summary className="cursor-pointer">{th ? `ข้อมูลที่ดาวน์โหลดไว้ (${files.length} ไฟล์)` : `Downloaded data (${files.length} files)`}</summary>
+          <div className="mt-2 grid gap-x-4 md:grid-cols-2">
+            {files.map((f) => <div key={f.symbol + f.interval} className="font-mono">{f.symbol} {f.interval}: {f.bars.toLocaleString()} · {day(f.first)} → {day(f.last)}</div>)}
           </div>
-        </div>
+        </details>
       )}
-
-      {/* Subtab 3: Monte Carlo Risk Modeling */}
-      {subTab === 'monte_carlo' && result.monteCarlo && (
-        <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/50 space-y-4">
-          <div>
-            <h3 className="text-sm font-bold text-white flex items-center gap-2">
-              <Gauge className="w-4 h-4 text-purple-400" />
-              <span>{lang === 'th' ? 'การจำลองความเสี่ยงมอนติคาร์โล 1,000 การทดลอง (Monte Carlo Stress Test)' : '1,000-Iteration Monte Carlo Stress Test'}</span>
-            </h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              {lang === 'th'
-                ? 'สุ่มสลับลำดับผลการเทรด 1,000 รอบเพื่อประเมินความเสี่ยงที่เลวร้ายที่สุด (Worst-Case Scenario) และความน่าจะเป็นที่จะล้างพอร์ต'
-                : 'Shuffles trade sequences 1,000 times to uncover tail risks and probability of ruin.'}
-            </p>
-          </div>
-
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono text-xs">
-            <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
-              <span className="text-slate-400 text-[11px] block mb-1">{lang === 'th' ? 'โอกาสที่พอร์ตจะกำไร' : 'Probability of Profit'}</span>
-              <span className="text-xl font-bold text-emerald-400">{result.monteCarlo.probabilityOfProfit}%</span>
-              <span className="text-[10px] text-slate-500 block">จาก 1,000 การจำลอง</span>
-            </div>
-
-            <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
-              <span className="text-slate-400 text-[11px] block mb-1">{lang === 'th' ? 'ความเสี่ยงขาดทุนสูงสุด (Worst DD)' : 'Worst Case Drawdown'}</span>
-              <span className="text-xl font-bold text-amber-400">-{result.monteCarlo.worstCaseDrawdown}%</span>
-              <span className="text-[10px] text-slate-500 block">ระดับความเชื่อมั่น 95%</span>
-            </div>
-
-            <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
-              <span className="text-slate-400 text-[11px] block mb-1">{lang === 'th' ? 'มูลค่าพอร์ตเฉลี่ย (Median)' : 'Median Ending Balance'}</span>
-              <span className="text-xl font-bold text-white">${result.monteCarlo.medianFinalBalance}</span>
-              <span className="text-[10px] text-slate-500 block">ผลตอบแทนเฉลี่ย</span>
-            </div>
-
-            <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
-              <span className="text-slate-400 text-[11px] block mb-1">{lang === 'th' ? 'โอกาสพอร์ตแตก (Risk of Ruin)' : 'Risk of Ruin'}</span>
-              <span className="text-xl font-bold text-emerald-400">0.00%</span>
-              <span className="text-[10px] text-emerald-500/80 block">ระบบ Cut Loss ล็อกความเสี่ยง 100%</span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Trade Log History Table */}
-      <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/40 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-white">
-            {lang === 'th' ? 'บันทึกประวัติการส่งคำสั่งและผลลัพธ์' : 'Simulated Trade Ledger'} ({result.trades.length} {lang === 'th' ? 'ออเดอร์' : 'trades'})
-          </h3>
-          <span className="text-xs text-slate-400 font-mono">
-            Taker Fee: {config.feeRatePct}% · Slippage: {config.slippagePct}%
-          </span>
-        </div>
-
-        <div className="overflow-x-auto max-h-72 overflow-y-auto">
-          <table className="w-full text-xs text-left">
-            <thead className="text-slate-400 border-b border-slate-800 bg-slate-950/60 font-mono sticky top-0">
-              <tr>
-                <th className="py-2.5 px-3">#</th>
-                <th className="py-2.5 px-3">{lang === 'th' ? 'เวลา' : 'Time'}</th>
-                <th className="py-2.5 px-3">{lang === 'th' ? 'ทิศทาง' : 'Side'}</th>
-                <th className="py-2.5 px-3 text-right">{lang === 'th' ? 'ขนาด' : 'Size'}</th>
-                <th className="py-2.5 px-3 text-right">{lang === 'th' ? 'ราคาเข้า' : 'Entry'}</th>
-                <th className="py-2.5 px-3 text-right">{lang === 'th' ? 'ราคาออก' : 'Exit'}</th>
-                <th className="py-2.5 px-3 text-right">{lang === 'th' ? 'ระยะเวลาถือ' : 'Duration'}</th>
-                <th className="py-2.5 px-3 text-right">{lang === 'th' ? 'กำไรสุทธิ ($)' : 'Net PnL ($)'}</th>
-                <th className="py-2.5 px-3 text-center">{lang === 'th' ? 'ผลลัพธ์' : 'Outcome'}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60 font-mono">
-              {result.trades.slice(0, 50).map((t, idx) => {
-                const isWin = t.type === 'WIN';
-                return (
-                  <tr key={t.id} className="hover:bg-slate-800/20">
-                    <td className="py-2 px-3 text-slate-500">{idx + 1}</td>
-                    <td className="py-2 px-3 text-slate-400">{new Date(t.time).toLocaleTimeString()}</td>
-                    <td className="py-2 px-3">
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                        t.side === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                      }`}>
-                        {t.side}
-                      </span>
-                    </td>
-                    <td className="py-2 px-3 text-right text-slate-300">{t.size}</td>
-                    <td className="py-2 px-3 text-right text-slate-300">{t.entryPrice.toFixed(2)}</td>
-                    <td className="py-2 px-3 text-right text-slate-300">{t.exitPrice.toFixed(2)}</td>
-                    <td className="py-2 px-3 text-right text-slate-400">{t.holdingTimeBars} bars</td>
-                    <td className={`py-2 px-3 text-right font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {isWin ? '+' : ''}${t.pnl.toFixed(2)}
-                    </td>
-                    <td className="py-2 px-3 text-center">
-                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                        isWin ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                      }`}>
-                        {isWin ? 'PROFIT' : 'STOPPED'}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
 };

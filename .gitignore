@@ -12,3 +12,7 @@ worker/.env
 backups
 *.zip
 worker/phase1/data/
+
+scripts/backup/
+scripts/payload/
+scripts/apply-*.mjs

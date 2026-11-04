@@ -13,6 +13,9 @@ import { ForexMock } from './forex-mock.ts';
 import { GeminiAnalyzer } from './gemini.ts';
 import { handlePhase1 } from './api.ts';
 import { openStore } from './store.ts';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { AiAnalyzer, AiVerdict, Candidate, Candle, MarketProvider } from './types.ts';
 import { keyOf } from './types.ts';
 
@@ -208,14 +211,14 @@ async function main() {
     const bad = await mk({ model: 'x', analyze: async () => { throw new Error('boom'); } });
     await bad.engine.runCycle();
     assert.equal(bad.store.openPositions().length, 0);
-    assert.ok(bad.store.recentSignals(10).every((s) => s.skip_reason === 'ai_unavailable'));
+    assert.ok(bad.store.recentSignals(10).every((s) => s.skip_reason === 'ai_unavailable' || s.skip_reason === 'spot_long_only'));
     const none = await mk(null);
     await none.engine.runCycle();
     assert.equal(none.store.openPositions().length, 0);
     const low = await mk(aiAll(0.55));
     await low.engine.runCycle();
     assert.equal(low.store.openPositions().length, 0);
-    assert.ok(low.store.recentSignals(10).every((s) => s.skip_reason === 'low_confidence'));
+    assert.ok(low.store.recentSignals(10).every((s) => s.skip_reason === 'low_confidence' || s.skip_reason === 'spot_long_only'));
   });
   await test('paper positions resolve to TP / SL / timeout with correct pnl', async () => {
     const t = await mk(aiAll(0.85), { SL_ATR_MULT: '1.5', TP_ATR_MULT: '2.25' });
@@ -261,6 +264,142 @@ async function main() {
     const add = (i: number, pnl: number) => { const id = t.store.openPosition({ openedAt: NOW, bot: 'spot', symbol: 'S' + i, side: 'BUY', entry: 1, sl: 0.9, tp: 1.1, sizeUsd: 15, confidence: 0.7, techScore: 0.7, signalId: null }); t.store.closePosition(id, NOW + i, 1, pnl, pnl > 0 ? 'tp' : 'sl'); };
     add(1, -1); add(2, 2); add(3, -1); add(4, -1);
     assert.equal(t.engine.breakerTripped('spot'), false);
+  });
+
+  console.log('\nfixes found in the audit');
+  await test('shared exit rules: stop-first, gap fills, slippage only on market exits', async () => {
+    const { exitCheck, entryFill, timeoutFill } = await import('./paper.ts');
+    const c = (o: number, h: number, l: number, cl: number): Candle => ({ openTime: 0, open: o, high: h, low: l, close: cl, volume: 1, closeTime: 1 });
+    const long = { side: 'BUY' as const, sl: 99, tp: 102 };
+    assert.deepEqual(exitCheck(long, c(100, 103, 98, 100), 0), { price: 99, outcome: 'sl' }); // both touched => stop
+    assert.deepEqual(exitCheck(long, c(98, 99, 97, 98), 0), { price: 98, outcome: 'sl' }); // gap below the stop fills at the open
+    assert.deepEqual(exitCheck(long, c(103, 104, 102.5, 103), 0), { price: 103, outcome: 'tp' }); // gap above target: better price
+    assert.ok(Math.abs(exitCheck(long, c(100, 100.5, 98.9, 99.5), 1)!.price - 99 * 0.99) < 1e-9); // 1% slippage on a stop
+    assert.equal(exitCheck(long, c(100, 102, 99.5, 101), 1)!.price, 102); // limit target: no slippage
+    const short = { side: 'SELL' as const, sl: 101, tp: 98 };
+    assert.deepEqual(exitCheck(short, c(100, 101.5, 97.5, 100), 0), { price: 101, outcome: 'sl' });
+    assert.equal(exitCheck(short, c(100, 100.5, 99.5, 100), 0), null);
+    assert.ok(entryFill('BUY', 100, 1) > 100 && entryFill('SELL', 100, 1) < 100);
+    assert.ok(timeoutFill('BUY', 100, 1) < 100 && timeoutFill('SELL', 100, 1) > 100);
+  });
+  await test('entry uses the LIVE price (last candle), not the stale last close', async () => {
+    const t = await mk(aiAll(0.85), { SLIPPAGE_PCT: '0' });
+    // make the forming candle (the last one) move away from the last closed candle
+    const data = (t.fut as any).data as Record<string, Candle[]>;
+    const arr = data.AAAUSDT;
+    const last = arr[arr.length - 1];
+    arr[arr.length - 1] = { ...last, close: last.close * 1.001, high: Math.max(last.high, last.close * 1.001) };
+    await t.engine.runCycle();
+    const p = t.store.openPositions('futures', 'AAAUSDT')[0];
+    assert.ok(p, 'position opened');
+    assert.ok(Math.abs(p.entry - arr[arr.length - 1].close) < 1e-9);
+  });
+  await test('spot SELL candidates never reach the AI, so they cannot use its quota', async () => {
+    let sentToAi: string[] = [];
+    const spy: AiAnalyzer = { model: 's', async analyze(c: Candidate[]) { sentToAi = c.map(keyOf); return new Map(); } };
+    const t = await mk(spy);
+    await t.engine.runCycle();
+    assert.ok(sentToAi.length > 0 && !sentToAi.includes('spot:BBBUSDT'));
+    assert.ok(t.store.recentSignals(50).some((s) => s.bot === 'spot' && s.symbol === 'BBBUSDT' && s.skip_reason === 'spot_long_only'));
+  });
+  await test('AI quota ties go to the most liquid symbol, deterministically', async () => {
+    let order: string[] = [];
+    const spy: AiAnalyzer = { model: 's', async analyze(c: Candidate[]) { order = c.map((x) => x.symbol); return new Map(); } };
+    const t = await mk(spy, { PHASE1_BOTS: 'futures' });
+    await t.engine.runCycle();
+    const first = [...order];
+    const t2 = await mk(spy, { PHASE1_BOTS: 'futures' });
+    await t2.engine.runCycle();
+    assert.deepEqual(order, first);
+  });
+  await test('breaker is a timed pause (not a permanent latch) and re-trips on the next losing streak', async () => {
+    const { breakerState } = await import('./paper.ts');
+    const L = (closedAt: number, pnl = -1) => ({ closedAt, pnl });
+    assert.deepEqual(breakerState([L(300), L(200), L(100)], 400, 3, 1000), { active: true, until: 1300 });
+    assert.equal(breakerState([L(300), L(200), L(100)], 1301, 3, 1000).active, false); // pause over
+    assert.equal(breakerState([L(300), L(200, 5), L(100)], 400, 3, 1000).active, false); // a win inside the streak
+    assert.equal(breakerState([L(300), L(200)], 400, 3, 1000).active, false); // not enough trades
+    assert.equal(breakerState([L(300), L(200), L(100)], 400, 3, 1000, 250).active, false); // reset after those trades
+  });
+  await test('per-side cap stops a one-way pile-up (market-wide moves)', async () => {
+    const { gate } = await import('./paper.ts');
+    const base = { bot: 'futures' as const, side: 'SELL' as const, symbol: 'X', now: 1e9, openForBot: 5, openForSide: 12, openOnSymbol: [], breakerActive: false, limits: { maxOpenPerBot: 20, maxOpenPerSide: 12, maxOrdersPerSymbol: 3, cooldownMs: 0 } };
+    assert.equal(gate(base), 'max_open_side');
+    assert.equal(gate({ ...base, openForSide: 11 }), null);
+    assert.equal(gate({ ...base, bot: 'spot' }), 'spot_long_only');
+  });
+
+  console.log('\nshadow tracking (does the AI filter actually help?)');
+  const aiMixed = (reject: string[]): AiAnalyzer => ({
+    model: 's',
+    async analyze(cands: Candidate[]) {
+      return new Map<string, AiVerdict>(cands.map((c) => { const no = reject.includes(c.symbol); return [keyOf(c), { key: keyOf(c), decision: no ? 'SKIP' : c.side, confidence: no ? 0.3 : 0.85, rationale: 'stub' } as AiVerdict]; }));
+    },
+  });
+  await test('AI-rejected signals become SHADOW positions, separate from real stats/caps/breaker', async () => {
+    const t = await mk(aiMixed(['BBBUSDT']), { PHASE1_BOTS: 'futures' });
+    await t.engine.runCycle();
+    assert.deepEqual(t.store.openPositions('futures').map((p) => `${p.symbol}:${p.side}`), ['AAAUSDT:BUY']);
+    const sh = t.store.openPositions('futures', undefined, 'shadow');
+    assert.deepEqual(sh.map((p) => `${p.symbol}:${p.side}:${p.shadow}`), ['BBBUSDT:SELL:1']);
+    assert.equal(sh[0].size_usd, 15);
+    const sig = t.store.recentSignals(10).find((x) => x.symbol === 'BBBUSDT')!;
+    assert.equal(sig.action, 'SHADOW'); assert.equal(sig.skip_reason, 'ai_skip');
+    assert.equal(t.store.stats('futures').open, 1); assert.equal(t.store.stats('futures', 'shadow').open, 1);
+    const st: any = t.engine.status();
+    assert.equal(st.bots.futures.open, 1); assert.equal(st.bots.futures.shadow.open, 1);
+  });
+  await test('shadow positions have their own caps: a full real book does not stop shadows (and vice versa)', async () => {
+    const t = await mk(aiMixed(['BBBUSDT']), { PHASE1_BOTS: 'futures', MAX_OPEN_PER_BOT: '1' });
+    await t.engine.runCycle();
+    assert.equal(t.store.openPositions('futures').length, 1);
+    assert.equal(t.store.openPositions('futures', undefined, 'shadow').length, 1);
+  });
+  await test('shadow positions resolve by the same rules and never touch real stats', async () => {
+    const t = await mk(aiMixed(['BBBUSDT']), { PHASE1_BOTS: 'futures', SLIPPAGE_PCT: '0' });
+    await t.engine.runCycle();
+    const shadow = t.store.openPositions('futures', 'BBBUSDT', 'shadow')[0];
+    t.advance(MS * 2);
+    const after = t.now();
+    t.fut.extra.set('BBBUSDT', [{ openTime: after - MS, open: shadow.entry, high: shadow.entry, low: shadow.tp * 0.999, close: shadow.tp, volume: 1, closeTime: after - 1 }]); // the short reaches its target
+    await t.engine.runCycle();
+    const s = t.store.stats('futures', 'shadow');
+    assert.equal(s.closed, 1); assert.equal(s.wins, 1); assert.ok(s.expectancyR! > 0);
+    assert.equal(t.store.stats('futures').closed, 0, 'real stats are untouched');
+    assert.equal(t.store.recentClosed({ limit: 10 }).length, 0);
+    assert.equal(t.store.recentClosed({ limit: 10, kind: 'shadow' }).length, 1);
+  });
+  await test('shadow losses never trip the circuit breaker; real losses do', async () => {
+    const t = await mk(aiAll(0.85));
+    const add = (shadow: boolean, i: number) => { const id = t.store.openPosition({ openedAt: NOW, bot: 'futures', symbol: 'Z' + i, side: 'BUY', entry: 100, sl: 99, tp: 102, sizeUsd: 15, confidence: 0.5, techScore: 0.7, signalId: null, shadow }); t.store.closePosition(id, NOW + i + 1, 99, -0.2, 'sl'); };
+    add(true, 1); add(true, 2); add(true, 3);
+    assert.equal(t.engine.breakerTripped('futures'), false);
+    add(false, 4); add(false, 5); add(false, 6);
+    assert.equal(t.engine.breakerTripped('futures'), true);
+  });
+  await test('no shadow when the AI gave no answer, when the signal never reached the AI, or when switched off', async () => {
+    const down = await mk({ model: 's', analyze: async () => { throw new Error('boom'); } }, { PHASE1_BOTS: 'futures' });
+    await down.engine.runCycle();
+    assert.equal(down.store.openPositions('futures', undefined, 'shadow').length, 0);
+    const capped = await mk(aiMixed(['AAAUSDT', 'BBBUSDT']), { PHASE1_BOTS: 'futures', AI_MAX_CANDIDATES: '1' });
+    await capped.engine.runCycle();
+    assert.equal(capped.store.openPositions('futures', undefined, 'shadow').length, 1, 'only the one signal the AI actually saw');
+    const off = await mk(aiMixed(['BBBUSDT']), { PHASE1_BOTS: 'futures', SHADOW_TRACKING: 'false' });
+    await off.engine.runCycle();
+    assert.equal(off.store.openPositions('futures', undefined, 'shadow').length, 0);
+  });
+  await test('an older database (no shadow column) is upgraded in place; old rows count as real', async () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'qt-mig-')), 'old.db');
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(file);
+    db.exec("CREATE TABLE positions (id INTEGER PRIMARY KEY, opened_at INTEGER, bot TEXT, symbol TEXT, side TEXT, entry REAL, sl REAL, tp REAL, size_usd REAL, confidence REAL, tech_score REAL, status TEXT, closed_at INTEGER, exit_price REAL, pnl_usd REAL, outcome TEXT, signal_id INTEGER)");
+    db.exec("INSERT INTO positions (opened_at,bot,symbol,side,entry,sl,tp,size_usd,confidence,tech_score,status,closed_at,exit_price,pnl_usd,outcome) VALUES (1,'futures','OLD','BUY',100,99,102,20,0.7,0.8,'closed',2,102,0.4,'tp')");
+    db.close();
+    const store = await openStore(file);
+    assert.equal(store.stats('futures').closed, 1); assert.equal(store.stats('futures', 'shadow').closed, 0);
+    store.openPosition({ openedAt: 3, bot: 'futures', symbol: 'NEW', side: 'BUY', entry: 1, sl: 0.9, tp: 1.2, sizeUsd: 15, confidence: 0.3, techScore: 0.7, signalId: null, shadow: true });
+    assert.equal(store.stats('futures', 'shadow').open, 1);
+    store.close();
   });
 
   console.log('\nforex mock');

@@ -14,15 +14,20 @@ export interface Phase1Config {
   minAiConfidence: number;
   maxOrdersPerSymbol: number;
   maxOpenPerBot: number;
+  maxOpenPerSide: number;
   entryCooldownMin: number;
   maxHoldHours: number;
   slAtrMult: number;
   tpAtrMult: number;
   maxNotionalUsd: number;
   breakerLosses: number;
+  breakerPauseMin: number;
+  slipPct: Record<BotId, number>;
   concurrency: number;
   maxSymbolsPerBot: number;
   aiMaxCandidates: number;
+  shadowTracking: boolean;
+  shadowSizeUsd: number;
   feePct: Record<BotId, number>;
   dbPath: string;
   geminiApiKey: string;
@@ -62,15 +67,20 @@ export function loadConfig(env: NodeJS.ProcessEnv): Phase1Config {
     minAiConfidence: num(env, 'MIN_AI_CONFIDENCE', 0.6, 0.5, 1),
     maxOrdersPerSymbol: num(env, 'MAX_ORDERS_PER_SYMBOL', 3, 1, 10),
     maxOpenPerBot: num(env, 'MAX_OPEN_PER_BOT', 20, 1, 200),
+    maxOpenPerSide: num(env, 'MAX_OPEN_PER_SIDE', 12, 1, 200),
     entryCooldownMin: num(env, 'ENTRY_COOLDOWN_MIN', 15, 0, 1440),
     maxHoldHours: num(env, 'MAX_HOLD_HOURS', 24, 1, 168),
     slAtrMult: num(env, 'SL_ATR_MULT', 1.5, 0.5, 10),
     tpAtrMult: num(env, 'TP_ATR_MULT', 2.25, 0.5, 20),
     maxNotionalUsd: num(env, 'MAX_NOTIONAL_USD', 50, 1, 100_000),
     breakerLosses: num(env, 'BREAKER_LOSSES', 3, 1, 50),
+    breakerPauseMin: num(env, 'BREAKER_PAUSE_MIN', 120, 1, 10080),
+    slipPct: { futures: num(env, 'SLIPPAGE_PCT', 0.02, 0, 1), spot: num(env, 'SLIPPAGE_PCT', 0.02, 0, 1), forex: 0 },
     concurrency: num(env, 'SCAN_CONCURRENCY', 8, 1, 20),
     maxSymbolsPerBot: num(env, 'MAX_SYMBOLS_PER_BOT', 300, 1, 1000),
     aiMaxCandidates: num(env, 'AI_MAX_CANDIDATES', 30, 1, 100),
+    shadowTracking: (env.SHADOW_TRACKING ?? 'true').trim().toLowerCase() !== 'false',
+    shadowSizeUsd: num(env, 'SHADOW_SIZE_USD', 15, 1, 1000),
     feePct: { futures: num(env, 'FEE_PCT_FUTURES', 0.05, 0, 1), spot: num(env, 'FEE_PCT_SPOT', 0.1, 0, 1), forex: 0 },
     dbPath: env.PHASE1_DB || path.join(here, 'data', 'learning.db'),
     geminiApiKey: (env.GEMINI_API_KEY || '').trim(),

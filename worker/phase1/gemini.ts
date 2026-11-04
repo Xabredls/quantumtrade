@@ -4,7 +4,7 @@ import { keyOf } from './types.ts';
 const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
 
 export class GeminiAnalyzer implements AiAnalyzer {
-  constructor(private opts: { apiKey: string; model: string; baseUrl?: string; timeoutMs?: number }) {}
+  constructor(private opts: { apiKey: string; model: string; baseUrl?: string; timeoutMs?: number; slAtr?: number; tpAtr?: number; maxHoldHours?: number }) {}
   get model() { return this.opts.model; }
 
   private prompt(cands: Candidate[]): string {
@@ -25,7 +25,7 @@ export class GeminiAnalyzer implements AiAnalyzer {
     return [
       'You review candidate trades produced by a rule-based technical scanner (EMA20/50, RSI14, MACD) for a PAPER-TRADING experiment.',
       'For each item decide whether to take the proposed side. Use ONLY the numbers given — do not invent news or prices.',
-      'Trade plan: stop = 1.5 x ATR, target = 2.25 x ATR, held up to 24h.',
+      `Trade plan: stop = ${this.opts.slAtr ?? 1.5} x ATR, target = ${this.opts.tpAtr ?? 2.25} x ATR, held up to ${this.opts.maxHoldHours ?? 24}h.`,
       'Rules: decision must be the proposed side or SKIP. confidence is your estimated probability (0-1) that the target is hit before the stop.',
       'Be conservative and well calibrated: most setups are near 0.5. Use SKIP for overextended RSI, weak or conflicting momentum, or very high ATR%.',
       'Return a JSON array with exactly one object per item, using the same key.',
@@ -41,6 +41,7 @@ export class GeminiAnalyzer implements AiAnalyzer {
       contents: [{ role: 'user', parts: [{ text: this.prompt(cands) }] }],
       generationConfig: {
         temperature: 0.2,
+        maxOutputTokens: 8192,
         responseMimeType: 'application/json',
         responseSchema: {
           type: 'ARRAY',
@@ -68,7 +69,7 @@ export class GeminiAnalyzer implements AiAnalyzer {
           signal: AbortSignal.timeout(this.opts.timeoutMs ?? 45_000),
         });
         if (res.status === 429 || res.status >= 500) throw new Error(`Gemini HTTP ${res.status}`);
-        if (!res.ok) throw new Error(`Gemini HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+        if (!res.ok) throw new Error(`Gemini HTTP ${res.status}: ${(await res.text()).replace(/\s+/g, ' ').slice(0, 200)}`);
         const data: any = await res.json();
         const text: string = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? '').join('') ?? '';
         const parsed = JSON.parse(text);

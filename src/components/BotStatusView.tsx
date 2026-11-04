@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Bot, RefreshCw, ShieldAlert, Play } from 'lucide-react';
 
 interface BotCycle { universe: number; passedVolume: number; scanned: number; candidates: number; opened: number; closed: number; error: string | null }
-interface BotStat { closed: number; wins: number; losses: number; winRate: number | null; pnlUsd: number; open: number; breakerTripped: boolean; lastCycle: BotCycle | null }
+interface Side { closed: number; wins: number; losses: number; winRate: number | null; pnlUsd: number; open: number; expectancyR: number | null }
+interface BotStat extends Side { shadow: Side; breakerTripped: boolean; breakerUntil?: number | null; lastCycle: BotCycle | null }
 interface Status {
   ok: boolean; dryRun: boolean; running: boolean; scanIntervalSec: number; klineInterval: string; dataSource: string;
   nextScanAt: number | null; lastScanAt: number | null; lastDurationMs: number | null;
@@ -12,6 +13,7 @@ interface Status {
 interface Signal { id: number; ts: number; bot: string; symbol: string; side: string; tech_score: number; ai_confidence: number | null; action: string; skip_reason: string | null; ai_rationale: string | null }
 
 const NAMES: Record<string, string> = { futures: 'Binance Futures', spot: 'Binance Spot', forex: 'Forex + Gold (Mock)' };
+const r2 = (x: number | null | undefined) => (x === null || x === undefined ? '-' : x.toFixed(2));
 const time = (ts: number | null) => (ts ? new Date(ts).toLocaleTimeString() : '-');
 
 export const BotStatusView: React.FC<{ lang: 'th' | 'en' }> = ({ lang }) => {
@@ -93,10 +95,19 @@ export const BotStatusView: React.FC<{ lang: 'th' | 'en' }> = ({ lang }) => {
                   <dt className="text-slate-400">{th ? 'ปิดแล้ว (ชนะ/แพ้)' : 'closed (W/L)'}</dt><dd>{s.closed} ({s.wins}/{s.losses})</dd>
                   <dt className="text-slate-400">Win rate</dt><dd>{s.winRate === null ? '-' : `${(s.winRate * 100).toFixed(0)}%`}</dd>
                   <dt className="text-slate-400">PnL (paper)</dt><dd className={s.pnlUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}>{s.pnlUsd.toFixed(2)} USD</dd>
+                  <dt className="text-slate-400">{th ? 'กำไร/เทรด AI อนุมัติ (R)' : 'R/trade AI approved'}</dt><dd>{r2(s.expectancyR)}</dd>
+                  <dt className="text-slate-400">{th ? 'AI ปฏิเสธ (ตามผลเงา) ปิด/เปิด' : 'AI rejected (shadow) closed/open'}</dt><dd>{s.shadow ? `${s.shadow.closed} / ${s.shadow.open}` : '-'}</dd>
+                  <dt className="text-slate-400">{th ? 'กำไร/เทรด AI ปฏิเสธ (R)' : 'R/trade AI rejected'}</dt><dd>{s.shadow ? r2(s.shadow.expectancyR) : '-'}</dd>
                 </dl>
                 {s.lastCycle?.error && <div className="mt-2 text-xs text-red-300">{s.lastCycle.error}</div>}
               </div>
             ))}
+          </div>
+
+          <div className="rounded border border-slate-700 bg-slate-800/40 p-2 text-xs text-slate-400">
+            {th
+              ? 'ถ้า "กำไร/เทรด AI อนุมัติ" ไม่ดีกว่า "AI ปฏิเสธ" อย่างต่อเนื่องเมื่อมีเทรดปิดแล้วหลายร้อยรายการ แปลว่า AI ยังไม่ได้ช่วยกรองสัญญาณ (ตำแหน่งเงาใช้กติกาเดียวกัน ไม่นับรวมในสถิติจริง)'
+              : 'If "R/trade AI approved" is not consistently better than "AI rejected" after a few hundred closed trades, the AI filter is not helping (shadow positions use the same rules and are excluded from real stats).'}
           </div>
 
           <div className="overflow-x-auto rounded-lg border border-slate-700">

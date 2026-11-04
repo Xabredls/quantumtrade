@@ -1,6 +1,8 @@
 import type http from 'node:http';
 import type { Phase1Engine } from './engine.ts';
 import type { BotId } from './types.ts';
+import { datasetStatus } from './backtest/data.ts';
+import { listReports, readLatestReport } from './backtest/report.ts';
 
 const send = (res: http.ServerResponse, code: number, body: unknown) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -14,7 +16,7 @@ const readJson = (req: http.IncomingMessage) => new Promise<any>((resolve, rejec
 const isBot = (b: unknown): b is BotId => b === 'futures' || b === 'spot' || b === 'forex';
 
 /** Caller must already have checked the bearer token. */
-export async function handlePhase1(req: http.IncomingMessage, res: http.ServerResponse, engine: Phase1Engine, store: { recentSignals: Function; recentClosed: Function }) {
+export async function handlePhase1(req: http.IncomingMessage, res: http.ServerResponse, engine: Phase1Engine, store: { recentSignals: Function; recentClosed: Function }, dataDir?: string) {
   const url = new URL(req.url || '/', 'http://x');
   const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 50));
   const botParam = url.searchParams.get('bot');
@@ -36,6 +38,15 @@ export async function handlePhase1(req: http.IncomingMessage, res: http.ServerRe
       if (!isBot(body.bot)) return send(res, 400, { ok: false, message: 'bot ต้องเป็น futures | spot | forex' });
       engine.resetBreaker(body.bot);
       return send(res, 200, { ok: true });
+    }
+    if (url.pathname.startsWith('/phase1/backtest/') && req.method === 'GET') {
+      if (!dataDir) return send(res, 503, { ok: false, message: 'ยังไม่ได้ตั้งโฟลเดอร์ข้อมูล backtest' });
+      if (url.pathname === '/phase1/backtest/list') return send(res, 200, { ok: true, dataDir, reports: listReports(dataDir) });
+      if (url.pathname === '/phase1/backtest/data') return send(res, 200, { ok: true, dataDir, datasets: datasetStatus(dataDir) });
+      if (url.pathname === '/phase1/backtest/latest') {
+        const report = readLatestReport(dataDir, url.searchParams.get('market') ?? '');
+        return report ? send(res, 200, { ok: true, report }) : send(res, 404, { ok: false, message: 'ยังไม่มีผล backtest ของตลาดนี้' });
+      }
     }
     return send(res, 404, { ok: false, message: 'not found' });
   } catch (e) {
